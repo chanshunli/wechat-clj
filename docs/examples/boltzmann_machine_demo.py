@@ -3,18 +3,21 @@
 运行:
     python docs/examples/boltzmann_machine_demo.py
 
-五个部分，一路推下来，每一步都是上一步的直接后果：
+一路推下来，每一步都是上一步的直接后果：
 
-    1. 1877 玻尔兹曼   S = k log W，以及 p ∝ exp(-E/kT) 是怎么冒出来的
-    2. 1982 Hopfield   把 exp(-E) 里的 E 换成 -½sᵀWs，得到一台确定性的能量下降机
-    3. 1985 Hinton     把"下降"换成"按玻尔兹曼分布采样"，模拟退火跳出局部极小
-    4. 2002 CD-1       受限玻尔兹曼机的学习律：正相 - 负相（数据项 - 模型项）
-    5. 今天            codechat/gpt.py:141-146 的 logits/temperature + softmax
-                       就是同一个 exp(-E/kT)/Z
+    1.  1877 玻尔兹曼   S = k log W，以及 p ∝ exp(-E/kT) 是怎么冒出来的
+    2.  1982 Hopfield   把 exp(-E) 里的 E 换成 -½sᵀWs，得到一台确定性的能量下降机
+    3.  1985 Hinton     把"下降"换成"按玻尔兹曼分布采样"，模拟退火跳出局部极小
+    3b. 名字的由来      测出来：这台机器的平稳分布**精确等于** exp(-E/T)/Z
+    4a. "受限"是什么     两个恒等式的数值验证：Σ_h 可解析求和、p(h|v) 可分解
+    4.  2002 CD-1       受限玻尔兹曼机的学习律：正相 - 负相（数据项 - 模型项）
+    5.  今天            codechat/gpt.py:141-146 的 logits/temperature + softmax
+                        就是同一个 exp(-E/kT)/Z
 
 产出（写到 docs/images/）:
     boltzmann_01_entropy_and_distribution.png
     boltzmann_02_hopfield_vs_boltzmann.png
+    boltzmann_02b_why_the_name.png
     boltzmann_03_rbm_cd1.png
     boltzmann_04_softmax_is_boltzmann.png
 
@@ -97,9 +100,9 @@ def part1_entropy_and_distribution():
     rows = []
     for T in temps:
         p = F.softmax(-E / T, dim=0)          # ← 注意：softmax(-E/T) 就是玻尔兹曼分布
-        S = -(p * p.clamp_min(1e-12).log()).sum().clamp_min(0.0)
-        rows.append((T, p, S.item()))
-        print(f"{T:>7.1f} | " + " ".join(f"{v:.3f}" for v in p) + f"   |   {S.item():.4f}")
+        S = max(-(p * p.clamp_min(1e-12).log()).sum().item(), 0.0)
+        rows.append((T, p, S))
+        print(f"{T:>7.1f} | " + " ".join(f"{v:.3f}" for v in p) + f"   |   {S:.4f}")
     print(f"\n  T → 0   ：全部塌到基态，S → 0        （= 贪心解码 / argmax）")
     print(f"  T → ∞   ：均匀分布，S → ln 5 = {math.log(5):.4f}  （= 完全随机）")
     print("  中间的每一个 T 都是「能量」和「熵」的一次配比。自由能 F = E - T·S 取极小。")
@@ -281,6 +284,94 @@ def part23_hopfield_vs_boltzmann():
 
 
 # ---------------------------------------------------------------------------
+# 3b. 名字的由来：这台机器的稳态分布「就是」玻尔兹曼分布
+# ---------------------------------------------------------------------------
+def part3b_why_the_name():
+    """为什么叫「玻尔兹曼机」而不是「随机 Hopfield 网络」。
+
+    因为它不是「用了玻尔兹曼的想法」，而是：让它自由跑下去，
+    它停留在状态 s 上的频率，精确等于 exp(-E(s)/T) / Z。
+    这里用 8 个单元（2^8 = 256 个态，可以穷举出真实分布）把这件事测出来。
+    """
+    title("3b", "为什么叫「玻尔兹曼机」：稳态分布 = exp(−E/T)/Z，可测")
+
+    N, T = 8, 1.0
+    g = torch.Generator().manual_seed(42)
+    W = torch.randn(N, N, generator=g) * 0.6
+    W = (W + W.t()) / 2          # 对称：细致平衡的前提
+    W.fill_diagonal_(0.0)
+
+    # 理论分布：穷举 2^8 = 256 个状态
+    states = torch.tensor([[1.0 if (m >> b) & 1 else -1.0 for b in range(N)] for m in range(1 << N)])
+    E_all = -0.5 * ((states @ W) * states).sum(1)
+    p_theory = F.softmax(-E_all / T, dim=0)          # exp(-E/T) / Z
+
+    # 经验分布：定温 Gibbs 采样（不退火 —— 退火是找极小，这里是要平衡分布）
+    torch.manual_seed(5)
+    s = torch.where(torch.rand(N) < 0.5, -1.0, 1.0)
+    counts = torch.zeros(1 << N)
+    burn_in, n_sweep = 2000, 200_000
+    for k in range(burn_in + n_sweep):
+        for i in torch.randperm(N):
+            s[i] = 1.0 if torch.rand(()) < torch.sigmoid(2.0 * (W[i] @ s) / T) else -1.0
+        if k >= burn_in:
+            idx = int(((s > 0).long() * (2 ** torch.arange(N))).sum())
+            counts[idx] += 1
+    p_emp = counts / counts.sum()
+
+    print(f"\n  {N} 个单元、对称 W、定温 T={T} 的 Gibbs 采样，跑 {n_sweep:,} 个 sweep。")
+    print("  把访问频率和 exp(−E/T)/Z 逐个状态对照（按理论概率排序，取前 10）：")
+    order = torch.argsort(p_theory, descending=True)
+    print(f"\n  {'状态':>10} {'E(s)':>9} {'理论 exp(−E/T)/Z':>18} {'实测频率':>12} {'比值':>8}")
+    for idx in order[:10]:
+        i = int(idx)
+        print(f"  {format(i, '08b'):>10} {E_all[i].item():>9.3f} {p_theory[i].item():>18.5f} "
+              f"{p_emp[i].item():>12.5f} {p_emp[i].item() / p_theory[i].item():>8.3f}")
+
+    # 量化吻合程度
+    kl = (p_theory * (p_theory.clamp_min(1e-12) / p_emp.clamp_min(1e-12)).log()).sum().item()
+    tv = 0.5 * (p_theory - p_emp).abs().sum().item()
+    mask = p_theory > 1e-4
+    corr = torch.corrcoef(torch.stack([p_theory[mask].log(), p_emp[mask].clamp_min(1e-9).log()]))[0, 1].item()
+    print(f"\n    KL(理论‖实测)   = {kl:.5f}")
+    print(f"    总变差距离 TV   = {tv:.5f}")
+    print(f"    log-log 相关系数 = {corr:.5f}")
+    print("\n  → 不是「近似」，不是「受启发于」。这台机器的平稳分布**就是**玻尔兹曼分布。")
+    print("    名字是描述，不是致敬。")
+    print("\n  三条直接推论：")
+    print("    (a) log p(s_a) − log p(s_b) = −(E_a − E_b)/T   能量差 = 对数概率差")
+    print("    (b) T → 0 时全部质量塌到最低能量态 → 退化成 Hopfield 网络")
+    print("    (c) 因为 E 对 w_ij 是线性的（∂E/∂w_ij = −s_i s_j），")
+    print("        而 log p = −E/T − log Z，所以梯度必然是「两个相关之差」——")
+    print("        1985 年那条学习律是「玻尔兹曼」这三个字的直接后果。")
+
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4.4))
+    ax = axes[0]
+    ax.loglog(p_theory[mask].numpy(), p_emp[mask].clamp_min(1e-9).numpy(), ".", ms=4, color="#c44e52")
+    lo = float(p_theory[mask].min()) * 0.6
+    ax.loglog([lo, 1], [lo, 1], "--", c="gray", lw=1, label="y = x")
+    ax.set_xlabel("理论 exp(−E/T)/Z"); ax.set_ylabel("Gibbs 实测频率")
+    ax.set_title(f"① 稳态分布 vs 玻尔兹曼分布（TV={tv:.4f}）")
+    ax.legend(fontsize=9)
+
+    ax = axes[1]
+    seen = counts > 0     # 从没被访问到的高能态没有 log 频率，不画
+    ax.plot(E_all[seen].numpy(), p_emp[seen].log().numpy(), ".", ms=4, color="#4c72b0",
+            label=f"实测 log 频率（{int(seen.sum())}/{1 << N} 个被访问到）")
+    ax.plot(E_all.numpy(), (-E_all / T - torch.logsumexp(-E_all / T, 0)).numpy(), "-",
+            c="crimson", lw=1.2, label="−E/T − log Z（直线）")
+    ax.set_xlabel("能量 E(s)"); ax.set_ylabel("log p(s)")
+    ax.set_title("② log p 对 E 是一条直线，斜率 = −1/T")
+    ax.legend(fontsize=9)
+
+    fig.suptitle("名字的由来：平稳分布精确等于 exp(−E/T)/Z", fontsize=13)
+    fig.tight_layout()
+    out = os.path.join(IMG, "boltzmann_02b_why_the_name.png")
+    fig.savefig(out, dpi=130); plt.close(fig)
+    print(f"\n  图已保存：{out}")
+
+
+# ---------------------------------------------------------------------------
 # 4. 1986 Smolensky / 2002 Hinton：受限玻尔兹曼机 + Contrastive Divergence
 # ---------------------------------------------------------------------------
 def bars_and_stripes(n=4):
@@ -347,6 +438,77 @@ class RBM:
         self.b += lr * (v0 - vk).mean(0)
         self.c += lr * (ph0 - phk).mean(0)
         return ((v0 - pv) ** 2).mean().item()   # 重构误差（诊断量，不是目标函数）
+
+
+def part4a_what_restricted_means():
+    """「受限」到底限掉了什么，又换来了什么 —— 两个恒等式，逐个数值验证。"""
+    title("4a", "「受限」是什么意思：删掉层内的边，换来两个恒等式")
+
+    n_vis, n_hid = 4, 3
+    rbm = RBM(n_vis, n_hid, seed=7)
+    rbm.W = torch.randn(n_vis, n_hid, generator=torch.Generator().manual_seed(9)) * 1.2
+    rbm.b = torch.randn(n_vis, generator=torch.Generator().manual_seed(10)) * 0.5
+    rbm.c = torch.randn(n_hid, generator=torch.Generator().manual_seed(11)) * 0.5
+
+    V = torch.tensor([[float((m >> i) & 1) for i in range(n_vis)] for m in range(1 << n_vis)])
+    H = torch.tensor([[float((m >> j) & 1) for j in range(n_hid)] for m in range(1 << n_hid)])
+
+    def joint_E(v, h):
+        return -(v @ rbm.W @ h) - (v @ rbm.b) - (h @ rbm.c)
+
+    print("\n  一个 4 可见 / 3 隐 的小 RBM，E(v,h) = −vᵀWh − bᵀv − cᵀh。")
+    print("  「受限」= 没有 v–v 的边，也没有 h–h 的边（能量里只有交叉项 vᵀWh）。")
+
+    # 恒等式 1：隐层可以被解析地积掉 —— Σ_h exp(-E(v,h)) == exp(-F(v))
+    print("\n  恒等式 ①  Σ_h exp(−E(v,h)) == exp(−F(v))，其中")
+    print("            F(v) = −bᵀv − Σ_j softplus(c_j + (vW)_j)")
+    print(f"\n  {'v':>6} {'穷举 Σ_h（8 项）':>18} {'解析 exp(−F(v))':>18} {'相对误差':>12}")
+    max_err = 0.0
+    for k in range(1 << n_vis):
+        v = V[k]
+        brute = torch.stack([torch.exp(-joint_E(v, H[j])) for j in range(1 << n_hid)]).sum()
+        analytic = torch.exp(-rbm.free_energy(v.unsqueeze(0))).squeeze()
+        err = abs((brute - analytic) / brute).item()
+        max_err = max(max_err, err)
+        if k < 5:
+            print(f"  {''.join(str(int(x)) for x in v):>6} {brute.item():>18.6f} "
+                  f"{analytic.item():>18.6f} {err:>12.2e}")
+    print(f"  ... 全部 16 个 v 的最大相对误差：{max_err:.2e}")
+    print("    → 隐层被 softplus 一行吃掉了。全连接玻尔兹曼机做不到这件事，")
+    print("      因为 h–h 的边会让 Σ_h 不能拆成每个 h_j 独立的乘积。")
+
+    # 恒等式 2：p(h|v) 完全分解成每个隐单元的独立 sigmoid
+    print("\n  恒等式 ②  p(h | v) == Π_j p(h_j | v)，且 p(h_j=1|v) = σ(c_j + (vW)_j)")
+    v = V[11]
+    logits = torch.stack([-joint_E(v, H[j]) for j in range(1 << n_hid)])
+    p_exact = F.softmax(logits, dim=0)                      # 穷举得到的 p(h|v)
+    p_marg = rbm.h_given_v(v.unsqueeze(0)).squeeze()        # 每个 h_j 的 sigmoid
+    p_fact = torch.stack([torch.prod(torch.where(H[j] > 0.5, p_marg, 1 - p_marg))
+                          for j in range(1 << n_hid)])      # 独立假设下的乘积
+    print(f"\n  取 v = {''.join(str(int(x)) for x in v)}，逐个 h 对照：")
+    print(f"  {'h':>6} {'穷举 p(h|v)':>14} {'Π_j σ(...)':>14} {'差':>10}")
+    for j in range(1 << n_hid):
+        print(f"  {''.join(str(int(x)) for x in H[j]):>6} {p_exact[j].item():>14.6f} "
+              f"{p_fact[j].item():>14.6f} {abs(p_exact[j] - p_fact[j]).item():>10.2e}")
+    print(f"\n    最大偏差 {(p_exact - p_fact).abs().max().item():.2e} —— 严格相等（数值误差量级）。")
+    print("    → 给定 v，3 个隐单元互相独立，可以**一次性并行**全部采完。")
+
+    # 代价与收益
+    print("""
+  受限的代价与收益：
+
+    没了什么                      换来什么
+    ─────────────────────────────────────────────────────────────────
+    v–v 的横向连接                p(h|v) 分解 → 整层并行采样
+      （可见单元之间的直接相关     Gibbs 一个 sweep 从「逐个单元 N 次串行」
+        只能通过 h 间接表达）       变成「两次矩阵乘法」
+    h–h 的横向连接                Σ_h 可解析求和 → 自由能 F(v) 有闭式
+      （隐单元之间不能互相解释      → 可以直接比较任意两个 v 的相对概率
+        away，表达力下降）           （虽然 Z 仍然算不动）
+
+  一句话：把无向图砍成二部图，损失一部分表达力，
+          换来「一步就能从 v 采到 h、再从 h 采回 v」。
+          2002 年的 CD-1 之所以可能，全部建立在这两个恒等式上。""")
 
 
 def part4_rbm():
@@ -518,6 +680,8 @@ def main():
     print(__doc__.split("配文")[0].rstrip())
     part1_entropy_and_distribution()
     part23_hopfield_vs_boltzmann()
+    part3b_why_the_name()
+    part4a_what_restricted_means()
     part4_rbm()
     part5_softmax_is_boltzmann()
 
